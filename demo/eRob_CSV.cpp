@@ -423,33 +423,94 @@ int erob_test() {
     // 8. Transition to OP state
     printf("__________STEP 8___________________\n");
 
-    // Send process data to the slaves
-    ec_send_processdata();
-    wkc = ec_receive_processdata(EC_TIMEOUTRET); // Receive process data and store the Work Counter
+    // 请求切换到 OPERATIONAL 状态
+    ec_slave[0].state = EC_STATE_OPERATIONAL;
+    ec_writestate(0);
 
-    // Set the first slave to operational state
-    ec_slave[0].state = EC_STATE_OPERATIONAL; // Change the state of the first slave to OP
-    ec_writestate(0); // Write the state change to the slave
+    // 等待所有从站进入 OPERATIONAL 状态
+    int retries = 40;
+    int all_op = 0;
+    do {
+        osal_usleep(50000); // 50ms
+        ec_statecheck(0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+        
+        all_op = 1;
+        for(int i = 1; i <= ec_slavecount; i++) {
+            ec_readstate();
+            if(ec_slave[i].state != EC_STATE_OPERATIONAL) {
+                all_op = 0;
+                printf("Slave %d State: 0x%02x, StatusCode: 0x%04x - %s\n",
+                       i, ec_slave[i].state, ec_slave[i].ALstatuscode,
+                       ec_ALstatuscode2string(ec_slave[i].ALstatuscode));
+                
+                // 如果从站报错，尝试清除错误
+                if(ec_slave[i].ALstatuscode != 0) {
+                    printf("Attempting to clear error for slave %d\n", i);
+                    rxpdo.controlword = 0x0080;  // Fault reset command
+                    memcpy(ec_slave[i].outputs, &rxpdo, sizeof(rxpdo_t));
+                    ec_send_processdata();
+                    osal_usleep(10000);  // 等待10ms
+                }
+            }
+        }
+        retries--;
+    } while (!all_op && retries > 0);
 
-    // Wait for the state transition to complete
-    if ((ec_statecheck(0, EC_STATE_OPERATIONAL, 5 * EC_TIMEOUTSTATE)) == EC_STATE_OPERATIONAL) {
-        printf("State changed to EC_STATE_OPERATIONAL: %d\n", EC_STATE_OPERATIONAL); // Confirm successful state change
-        printf("___________________________________________\n");
-    } else {
-        printf("State could not be changed to EC_STATE_OPERATIONAL\n"); // Error message if state change fails
-        for (int cnt = 1; cnt <= ec_slavecount; cnt++) {
-            printf("ALstatuscode: %d\n", ecx_context.slavelist[cnt].ALstatuscode); // Print AL status codes for each slave
+    if (!all_op) {
+        printf("Failed to reach operational state for all slaves\n");
+        return -1;
+    }
+
+    printf("All slaves reached operational state successfully\n");
+
+    // Calculate the expected Work Counter (WKC)
+    expectedWKC = (ec_group[0].outputsWKC * 2) + ec_group[0].inputsWKC; // Calculate expected WKC based on outputs and inputs
+    printf("Calculated workcounter %d\n", expectedWKC);
+
+    // Read and display basic status information of the slaves
+    ec_readstate(); // Read the state of all slaves
+    for(int i = 1; i <= ec_slavecount; i++) {
+        printf("Slave %d\n", i);
+        printf("  State: %02x\n", ec_slave[i].state); // Print the state of the slave
+        printf("  ALStatusCode: %04x\n", ec_slave[i].ALstatuscode); // Print the AL status code
+        printf("  Delay: %d\n", ec_slave[i].pdelay); // Print the delay of the slave
+        printf("  Has DC: %d\n", ec_slave[i].hasdc); // Check if the slave supports Distributed Clock
+        printf("  DC Active: %d\n", ec_slave[i].DCactive); // Check if DC is active for the slave
+        printf("  DC supported: %d\n", ec_slave[i].hasdc); // Print if DC is supported
+    }
+
+    // Read DC synchronization configuration using the correct parameters
+    for(int i = 1; i <= ec_slavecount; i++) {
+        uint16_t dcControl = 0; // Variable to hold DC control configuration
+        int32_t cycleTime = 0; // Variable to hold cycle time
+        int32_t shiftTime = 0; // Variable to hold shift time
+        int size; // Variable to hold size for reading
+
+        // Read DC synchronization configuration, adding the correct size parameter
+        size = sizeof(dcControl);
+        if (ec_SDOread(i, 0x1C32, 0x01, FALSE, &size, &dcControl, EC_TIMEOUTSAFE) > 0) {
+            printf("Slave %d DC Configuration:\n", i);
+            printf("  DC Control: 0x%04x\n", dcControl); // Print the DC control configuration
+            
+            size = sizeof(cycleTime);
+            if (ec_SDOread(i, 0x1C32, 0x02, FALSE, &size, &cycleTime, EC_TIMEOUTSAFE) > 0) {
+                printf("  Cycle Time: %d ns\n", cycleTime); // Print the cycle time
+            }
+
         }
     }
 
-    // Read and display the state of all slaves
-    ec_readstate(); // Read the state of all slaves
-    for (int i = 1; i <= ec_slavecount; i++) {
-        printf("Slave %d: Type %d, Address 0x%02x, State Machine actual %d, required %d\n", 
-               i, ec_slave[i].eep_id, ec_slave[i].configadr, ec_slave[i].state, EC_STATE_OPERATIONAL); // Print slave information
-        printf("Name: %s\n", ec_slave[i].name); // Print the name of the slave
-        printf("___________________________________________\n");
-    }
+    printf("__________STEP 6___________________\n");
+
+    // Start the EtherCAT thread for real-time processing
+    start_ecatthread_thread = TRUE; // Flag to indicate that the EtherCAT thread should start
+    osal_thread_create_rt(&thread1, stack64k * 2, (void *)&ecatthread, (void *)&ctime_thread); // Create the real-time EtherCAT thread
+    // set_thread_affinity(*thread1, 4); // Optional: Set CPU affinity for the thread
+    osal_thread_create(&thread2, stack64k * 2, (void *)&ecatcheck, NULL); // Create the EtherCAT check thread
+    // set_thread_affinity(*thread2, 5); // Optional: Set CPU affinity for the thread
+    printf("___________________________________________\n");
+
+    my_RA = 0; // Reset read access variable
 
     // 9. Configure servomotor and mode operation
     printf("__________STEP 9___________________\n");
@@ -587,21 +648,25 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
     long cycle_time_ns;
     int64 dc_time_offset = 0;
     int dc_sync_counter = 0;
-    const int DC_SYNC_INTERVAL = 10;  // 减小同步间隔，提高同步频率
+    const int DC_SYNC_INTERVAL = 10;
 
-    // 统计变量
+    // 添加统计变量
     long min_cycle_time = LONG_MAX;
     long max_cycle_time = 0;
     long total_cycle_time = 0;
     int cycle_count = 0;
-    int print_interval = 1000;
+    const int print_interval = 1000;
 
-    // 初始化时间，与DC时钟同步
+    // 为每个从站维护状态记录
+    uint16_t slave_last_status[EC_MAXSLAVE] = {0};
+
+    // 初始化时间
     clock_gettime(CLOCK_MONOTONIC, &ts);
     cycletime = *(int *)ptr * 1000;  // 转换为纳秒
 
-    // 等待下一个整数周期开始
-    ts.tv_nsec = (ts.tv_nsec / cycletime + 1) * cycletime;
+    // 对齐到下一个整数周期
+    ts.tv_nsec = (ts.tv_nsec / cycletime) * cycletime;
+    ts.tv_nsec += cycletime;
     if (ts.tv_nsec >= NSEC_PER_SEC) {
         ts.tv_sec++;
         ts.tv_nsec -= NSEC_PER_SEC;
@@ -610,59 +675,48 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
     // 初始化DC同步
     toff = 0;
     if (ec_slave[0].hasdc) {
-        // 获取当前DC时间
         dc_time_offset = ec_DCtime;
-        // 计算与系统时间的偏差
-        int64 system_time = ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
-        toff = dc_time_offset - system_time;
     }
-
-    // 发送初始数据
-    rxpdo.controlword = 0x0080;
-    rxpdo.target_velocity = 0;
-    rxpdo.mode_of_operation = 9;
-    rxpdo.padding = 0;
-    
-    ec_send_processdata();
-    wkc = ec_receive_processdata(EC_TIMEOUTRET);
-
-    // 为每个从站维护状态记录
-    uint16_t slave_last_status[EC_MAXSLAVE] = {0};
 
     while (1) {
         // 开始测量周期时间
         clock_gettime(CLOCK_MONOTONIC, &cycle_start);
 
-        // 1. DC同步处理
+        // 1. 发送过程数据
+        ec_send_processdata();
+        
+        // 2. 等待到下一个周期
+        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {
+            printf("clock_nanosleep error: %s\n", strerror(errno));
+            // 重新同步时间
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            ts.tv_nsec = (ts.tv_nsec / cycletime) * cycletime + cycletime;
+            if (ts.tv_nsec >= NSEC_PER_SEC) {
+                ts.tv_sec++;
+                ts.tv_nsec -= NSEC_PER_SEC;
+            }
+            continue;
+        }
+
+        // 3. 计算下一个周期时间点
+        ts.tv_nsec += cycletime;
+        if (ts.tv_nsec >= NSEC_PER_SEC) {
+            ts.tv_sec++;
+            ts.tv_nsec -= NSEC_PER_SEC;
+        }
+
+        // 4. DC同步处理
         if (ec_slave[0].hasdc) {
             dc_sync_counter++;
             if (dc_sync_counter >= DC_SYNC_INTERVAL) {
-                // 获取当前DC时间
-                int64 dc_time = ec_DCtime;
-                // 计算期望的下一个周期时间
-                int64 next_dc = dc_time + cycletime;
-                // 调整系统时间以匹配DC时钟
-                ec_sync(dc_time, cycletime, &toff);
+                ec_sync(ec_DCtime, cycletime, &toff);
                 dc_sync_counter = 0;
             }
         }
 
-        // 2. 计算下一个周期的精确时间点
-        int64 next_cycle = (ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec) + cycletime + toff;
-        ts.tv_sec = next_cycle / NSEC_PER_SEC;
-        ts.tv_nsec = next_cycle % NSEC_PER_SEC;
-
-        // 3. 发送过程数据
-        ec_send_processdata();
-        
-        // 4. 精确等待下一个周期
-        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {
-            printf("clock_nanosleep error\n");
-            continue;
-        }
-
         // 5. 接收和处理数据
         wkc = ec_receive_processdata(EC_TIMEOUTRET);
+        
         if (wkc >= expectedWKC) {
             for (int slave = 1; slave <= ec_slavecount; slave++) {
                 memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
@@ -673,11 +727,19 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
                     printf("Slave %d: State changed from 0x%04x to 0x%04x\n", 
                            slave, slave_last_status[slave], status);
                     
-                    // 根据状态变化发送相应命令
+                    // 检查是否有错误状态码
+                    if (ec_slave[slave].ALstatuscode != 0) {
+                        printf("Slave %d has error code: 0x%04x - %s\n",
+                               slave, ec_slave[slave].ALstatuscode,
+                               ec_ALstatuscode2string(ec_slave[slave].ALstatuscode));
+                    }
+                    
                     switch(status) {
                         case STATE_FAULT:
                             rxpdo.controlword = 0x0080;  // Fault reset
                             printf("Slave %d: Fault detected, sending reset\n", slave);
+                            // 等待错误清除
+                            osal_usleep(10000);
                             break;
                             
                         case STATE_SWITCH_ON_DISABLED:
@@ -854,9 +916,6 @@ float correct_rate = 0;
 
 // Main function
 int main(int argc, char **argv) {
-    // Add sched.h header if not already included
-    #include <sched.h>
-    
     needlf = FALSE;
     inOP = FALSE;
     
@@ -866,8 +925,7 @@ int main(int argc, char **argv) {
     
     start_ecatthread_thread = FALSE;
     dorun = 0;
-
-    ctime_thread = 500;  // Communication period
+    ctime_thread = 1000;  // Communication period
 
     // Set the highest real-time priority
     struct sched_param param;
@@ -881,49 +939,19 @@ int main(int argc, char **argv) {
         perror("mlockall failed");
     }
 
-    // 修改 CPU affinity 设置
+    // 只设置主线程的CPU亲和性
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(2, &cpuset);  // 只使用 CPU core 2
+    CPU_SET(2, &cpuset);  // 主线程使用 CPU core 2
 
     if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == -1) {
         perror("sched_setaffinity");
         return EXIT_FAILURE;
     }
 
-    printf("Running on CPU core 2\n");
+    printf("Main thread running on CPU core 2\n");
 
-    // 创建线程时也分别设置 affinity
-    start_ecatthread_thread = FALSE;
-    dorun = 0;
-    ctime_thread = 1000;
-
-    // 创建实时线程
-    osal_thread_create_rt(&thread1, stack64k * 2, (void *)&ecatthread, (void *)&ctime_thread);
-    
-    // 获取实际的 pthread_t 并设置 affinity
-    pthread_t* pthread1 = (pthread_t*)thread1;
-    if (pthread1) {
-        pthread_setaffinity_np(*pthread1, sizeof(cpu_set_t), &cpuset);
-    }
-
-    // 监控线程使用另一个核心
-    cpu_set_t check_cpuset;
-    CPU_ZERO(&check_cpuset);
-    CPU_SET(3, &check_cpuset);  // 监控线程使用 CPU core 3
-    
-    // 创建监控线程
-    osal_thread_create(&thread2, stack64k * 2, (void *)&ecatcheck, NULL);
-    
-    // 获取实际的 pthread_t 并设置 affinity
-    pthread_t* pthread2 = (pthread_t*)thread2;
-    if (pthread2) {
-        pthread_setaffinity_np(*pthread2, sizeof(cpu_set_t), &check_cpuset);
-    }
-
-    printf("EtherCAT RT thread bound to CPU 2\n");
-    printf("EtherCAT check thread bound to CPU 3\n");
-
+    // 调用erob_test()，线程的CPU亲和性将在其中设置
     erob_test();
     printf("End program\n");
 
