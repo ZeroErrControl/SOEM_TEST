@@ -28,6 +28,7 @@
 #include <cstdint>
 
 #include <sched.h>
+#include <climits>  // 添加这行来获取 LONG_MAX 定义
 
 // Global variables for EtherCAT communication
 char IOmap[4096]; // I/O mapping for EtherCAT
@@ -581,130 +582,179 @@ void add_timespec(struct timespec *ts, int64 addtime) {
  */
 OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
     struct timespec ts, tleft;
-    int ht;
     int64 cycletime;
     struct timespec cycle_start, cycle_end;
     long cycle_time_ns;
     int64 dc_time_offset = 0;
     int dc_sync_counter = 0;
-    const int DC_SYNC_INTERVAL = 100;  // 每100个周期进行一次完整的DC同步
+    const int DC_SYNC_INTERVAL = 10;  // 减小同步间隔，提高同步频率
 
-    // 初始化时间
+    // 统计变量
+    long min_cycle_time = LONG_MAX;
+    long max_cycle_time = 0;
+    long total_cycle_time = 0;
+    int cycle_count = 0;
+    int print_interval = 1000;
+
+    // 初始化时间，与DC时钟同步
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    ht = (ts.tv_nsec / 1000000) + 1;
-    ts.tv_nsec = ht * 1000000;
+    cycletime = *(int *)ptr * 1000;  // 转换为纳秒
+
+    // 等待下一个整数周期开始
+    ts.tv_nsec = (ts.tv_nsec / cycletime + 1) * cycletime;
     if (ts.tv_nsec >= NSEC_PER_SEC) {
         ts.tv_sec++;
         ts.tv_nsec -= NSEC_PER_SEC;
     }
-    
-    cycletime = *(int *)ptr * 1000;  // 转换为纳秒
+
+    // 初始化DC同步
     toff = 0;
-    
-    // 初始化PDO数据
+    if (ec_slave[0].hasdc) {
+        // 获取当前DC时间
+        dc_time_offset = ec_DCtime;
+        // 计算与系统时间的偏差
+        int64 system_time = ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
+        toff = dc_time_offset - system_time;
+    }
+
+    // 发送初始数据
     rxpdo.controlword = 0x0080;
     rxpdo.target_velocity = 0;
     rxpdo.mode_of_operation = 9;
     rxpdo.padding = 0;
     
-    // 初始DC同步
-    if (ec_slave[0].hasdc) {
-        dc_time_offset = ec_DCtime - ts.tv_sec * NSEC_PER_SEC - ts.tv_nsec;
-    }
-    
-    // 发送初始数据
     ec_send_processdata();
     wkc = ec_receive_processdata(EC_TIMEOUTRET);
 
-    // 为每个从站维护一个状态记录
+    // 为每个从站维护状态记录
     uint16_t slave_last_status[EC_MAXSLAVE] = {0};
 
     while (1) {
-        // 1. 计算下一个周期的时间点
-        int64 next_cycle_time = cycletime + toff;
+        // 开始测量周期时间
+        clock_gettime(CLOCK_MONOTONIC, &cycle_start);
+
+        // 1. DC同步处理
         if (ec_slave[0].hasdc) {
             dc_sync_counter++;
             if (dc_sync_counter >= DC_SYNC_INTERVAL) {
-                ec_sync(ec_DCtime, cycletime, &toff);
+                // 获取当前DC时间
+                int64 dc_time = ec_DCtime;
+                // 计算期望的下一个周期时间
+                int64 next_dc = dc_time + cycletime;
+                // 调整系统时间以匹配DC时钟
+                ec_sync(dc_time, cycletime, &toff);
                 dc_sync_counter = 0;
             }
         }
-        add_timespec(&ts, next_cycle_time);
-        
-        // 2. 发送过程数据
+
+        // 2. 计算下一个周期的精确时间点
+        int64 next_cycle = (ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec) + cycletime + toff;
+        ts.tv_sec = next_cycle / NSEC_PER_SEC;
+        ts.tv_nsec = next_cycle % NSEC_PER_SEC;
+
+        // 3. 发送过程数据
         ec_send_processdata();
         
-        // 3. 精确等待
+        // 4. 精确等待下一个周期
         if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {
             printf("clock_nanosleep error\n");
             continue;
         }
-        
-        clock_gettime(CLOCK_MONOTONIC, &cycle_start);
-        
-        // 4. 接收和处理数据
+
+        // 5. 接收和处理数据
         wkc = ec_receive_processdata(EC_TIMEOUTRET);
         if (wkc >= expectedWKC) {
             for (int slave = 1; slave <= ec_slavecount; slave++) {
                 memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
                 uint16_t status = txpdo.statusword & 0x006F;
                 
-                // 完整的状态机处理
-                switch(status) {
-                    case STATE_FAULT:
-                        rxpdo.controlword = 0x0080;  // Fault reset
-                        rxpdo.target_velocity = 0;
-                        printf("Slave %d: Fault state, sending reset command\n", slave);
-                        break;
-                        
-                    case STATE_SWITCH_ON_DISABLED:
-                        rxpdo.controlword = 0x0006;  // Shutdown command
-                        rxpdo.target_velocity = 0;
-                        printf("Slave %d: Switch on disabled -> Ready to switch on\n", slave);
-                        break;
-                        
-                    case STATE_READY_TO_SWITCH_ON:
-                        rxpdo.controlword = 0x0007;  // Switch on command
-                        rxpdo.target_velocity = 0;
-                        printf("Slave %d: Ready to switch on -> Switched on\n", slave);
-                        break;
-                        
-                    case STATE_SWITCHED_ON:
-                        rxpdo.controlword = 0x000F;  // Enable operation command
-                        rxpdo.target_velocity = 0;
-                        printf("Slave %d: Switched on -> Operation enabled\n", slave);
-                        break;
-                        
-                    case STATE_OPERATION_ENABLED:
-                        rxpdo.controlword = 0x000F;  // Keep enabled
-                        rxpdo.target_velocity = 10000;  // Set target velocity
-                        if (status != slave_last_status[slave]) {
-                            printf("Slave %d: Operation enabled, running\n", slave);
-                        }
-                        break;
-                        
-                    default:
-                        rxpdo.controlword = 0x0006;  // Default to shutdown
-                        rxpdo.target_velocity = 0;
-                        printf("Slave %d: Unknown state 0x%04x\n", slave, status);
-                        break;
+                // 只在状态真正发生变化时处理
+                if (status != slave_last_status[slave]) {
+                    printf("Slave %d: State changed from 0x%04x to 0x%04x\n", 
+                           slave, slave_last_status[slave], status);
+                    
+                    // 根据状态变化发送相应命令
+                    switch(status) {
+                        case STATE_FAULT:
+                            rxpdo.controlword = 0x0080;  // Fault reset
+                            printf("Slave %d: Fault detected, sending reset\n", slave);
+                            break;
+                            
+                        case STATE_SWITCH_ON_DISABLED:
+                            rxpdo.controlword = 0x0006;  // Shutdown command
+                            printf("Slave %d: Sending shutdown command\n", slave);
+                            break;
+                            
+                        case STATE_READY_TO_SWITCH_ON:
+                            rxpdo.controlword = 0x0007;  // Switch on command
+                            printf("Slave %d: Sending switch on command\n", slave);
+                            break;
+                            
+                        case STATE_SWITCHED_ON:
+                            rxpdo.controlword = 0x000F;  // Enable operation command
+                            printf("Slave %d: Sending enable operation command\n", slave);
+                            break;
+                            
+                        case STATE_OPERATION_ENABLED:
+                            rxpdo.controlword = 0x000F;  // Keep enabled
+                            printf("Slave %d: Operation enabled\n", slave);
+                            break;
+                            
+                        default:
+                            rxpdo.controlword = 0x0006;  // Default to shutdown
+                            printf("Slave %d: Unknown state 0x%04x\n", slave, status);
+                            break;
+                    }
+                    
+                    // 记录新状态
+                    slave_last_status[slave] = status;
+                } else {
+                    // 保持当前状态的控制字
+                    switch(status) {
+                        case STATE_OPERATION_ENABLED:
+                            rxpdo.controlword = 0x000F;  // Keep enabled
+                            break;
+                        default:
+                            // 保持最后一次发送的控制字
+                            break;
+                    }
                 }
                 
-                // 保持CSV模式
+                // 始终保持速度为0和CSV模式
+                rxpdo.target_velocity = 0;
                 rxpdo.mode_of_operation = 9;
                 
                 // 更新输出
                 memcpy(ec_slave[slave].outputs, &rxpdo, sizeof(rxpdo_t));
-                
-                // 记录上一次状态
-                slave_last_status[slave] = status;
             }
         }
         
-        // 监控周期时间
+        // 结束测量周期时间
         clock_gettime(CLOCK_MONOTONIC, &cycle_end);
         cycle_time_ns = (cycle_end.tv_sec - cycle_start.tv_sec) * NSEC_PER_SEC +
                        (cycle_end.tv_nsec - cycle_start.tv_nsec);
+        
+        // 更新统计信息
+        min_cycle_time = std::min(min_cycle_time, cycle_time_ns);
+        max_cycle_time = std::max(max_cycle_time, cycle_time_ns);
+        total_cycle_time += cycle_time_ns;
+        cycle_count++;
+        
+        // 定期打印统计信息
+        if (cycle_count >= print_interval) {
+            printf("\nPDO Cycle Statistics:\n");
+            printf("Min cycle time: %ld ns\n", min_cycle_time);
+            printf("Max cycle time: %ld ns\n", max_cycle_time);
+            printf("Avg cycle time: %ld ns\n", total_cycle_time / cycle_count);
+            printf("Expected cycle time: %ld ns\n", cycletime);
+            printf("Overruns: %d\n\n", cycle_time_ns > cycletime * 1.2 ? 1 : 0);
+            
+            // 重置统计
+            min_cycle_time = LONG_MAX;
+            max_cycle_time = 0;
+            total_cycle_time = 0;
+            cycle_count = 0;
+        }
         
         if (cycle_time_ns > cycletime * 1.2) {
             printf("WARNING: Cycle time exceeded: %ld ns (expected: %ld ns)\n", 
