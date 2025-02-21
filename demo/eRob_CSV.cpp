@@ -93,6 +93,23 @@ int32_t received_target = 0;
 rxpdo_t rxpdo;  // Global variable, used for sending data to slaves
 txpdo_t txpdo;  // Global variable, used for receiving data from slaves
 
+
+// CiA402 状态字位定义
+#define STATUSWORD_READY_TO_SWITCH_ON_BIT    (1<<0)  // Bit 0
+#define STATUSWORD_SWITCHED_ON_BIT           (1<<1)  // Bit 1
+#define STATUSWORD_OPERATION_ENABLED_BIT     (1<<2)  // Bit 2
+#define STATUSWORD_FAULT_BIT                 (1<<3)  // Bit 3
+#define STATUSWORD_VOLTAGE_ENABLED_BIT       (1<<4)  // Bit 4
+#define STATUSWORD_QUICK_STOP_BIT           (1<<5)  // Bit 5
+#define STATUSWORD_SWITCH_ON_DISABLED_BIT    (1<<6)  // Bit 6
+
+// CiA402 控制字位定义
+#define CONTROLWORD_SWITCH_ON_BIT            (1<<0)  // Bit 0
+#define CONTROLWORD_ENABLE_VOLTAGE_BIT       (1<<1)  // Bit 1
+#define CONTROLWORD_QUICK_STOP_BIT          (1<<2)  // Bit 2
+#define CONTROLWORD_ENABLE_OPERATION_BIT     (1<<3)  // Bit 3
+#define CONTROLWORD_FAULT_RESET_BIT          (1<<7)  // Bit 7
+
 struct MotorStatus {
     bool is_operational;
     uint16_t status_word;
@@ -137,6 +154,11 @@ int erob_test();
 uint16_t data_R;
 
 int erob_test() {
+    // 添加时间测量变量
+    struct timespec start_time, current_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    int print_interval = 0;  // 用于控制打印间隔
+    
     int rdl; // Variable to hold read data length
     SLAVE_ID = 1; // Set the slave ID to 1
     int i, j, oloop, iloop, chk; // Loop control variables
@@ -531,7 +553,49 @@ int erob_test() {
         }
 
         while(1) {
-            osal_usleep(100000);
+            // 计算当前运行时间
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            double elapsed_time = (current_time.tv_sec - start_time.tv_sec) + 
+                                 (current_time.tv_nsec - start_time.tv_nsec) / 1e9;
+            
+            // 每秒打印一次运行时间和电机状态
+            if (current_time.tv_sec > print_interval) {
+                printf("\n=== System Status at %.2f seconds ===\n", elapsed_time);
+                
+                // 读取并打印每个从站的状态
+                for (int slave = 1; slave <= ec_slavecount; slave++) {
+                    memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
+                    
+                    // 解析状态字
+                    bool is_ready = (txpdo.statusword & STATUSWORD_READY_TO_SWITCH_ON_BIT);
+                    bool is_switched_on = (txpdo.statusword & STATUSWORD_SWITCHED_ON_BIT);
+                    bool is_enabled = (txpdo.statusword & STATUSWORD_OPERATION_ENABLED_BIT);
+                    bool has_fault = (txpdo.statusword & STATUSWORD_FAULT_BIT);
+                    
+                    printf("Slave %d:\n", slave);
+                    printf("  Status: 0x%04x (Ready=%d, On=%d, Enabled=%d, Fault=%d)\n",
+                           txpdo.statusword, is_ready, is_switched_on, is_enabled, has_fault);
+                    printf("  Position: %d counts (%.2f deg)\n", 
+                           txpdo.actual_position, txpdo.actual_position * Cnt_to_deg);
+                    printf("  Velocity: %d counts/s\n", txpdo.actual_velocity);
+                    printf("  Torque: %d \n", txpdo.actual_torque);
+                    
+                    // 打印控制命令
+                    printf("  Command: Controlword=0x%04x, Target Velocity=%d\n",
+                           rxpdo.controlword, rxpdo.target_velocity);
+                }
+                
+                printf("----------------------------------------\n");
+                print_interval = current_time.tv_sec;  // 更新下一次打印时间
+            }
+
+            // 检查是否需要退出
+            if (!start_ecatthread_thread) {
+                printf("\nProgram stopped. Total running time: %.2f seconds\n", elapsed_time);
+                break;
+            }
+
+            osal_usleep(100000);  // 100ms延时，避免过于频繁的循环
         }
     }
 
@@ -669,21 +733,7 @@ void add_timespec(struct timespec *ts, int64 addtime) {
     }
 }
 
-// CiA402 状态字位定义
-#define STATUSWORD_READY_TO_SWITCH_ON_BIT    (1<<0)  // Bit 0
-#define STATUSWORD_SWITCHED_ON_BIT           (1<<1)  // Bit 1
-#define STATUSWORD_OPERATION_ENABLED_BIT     (1<<2)  // Bit 2
-#define STATUSWORD_FAULT_BIT                 (1<<3)  // Bit 3
-#define STATUSWORD_VOLTAGE_ENABLED_BIT       (1<<4)  // Bit 4
-#define STATUSWORD_QUICK_STOP_BIT           (1<<5)  // Bit 5
-#define STATUSWORD_SWITCH_ON_DISABLED_BIT    (1<<6)  // Bit 6
 
-// CiA402 控制字位定义
-#define CONTROLWORD_SWITCH_ON_BIT            (1<<0)  // Bit 0
-#define CONTROLWORD_ENABLE_VOLTAGE_BIT       (1<<1)  // Bit 1
-#define CONTROLWORD_QUICK_STOP_BIT          (1<<2)  // Bit 2
-#define CONTROLWORD_ENABLE_OPERATION_BIT     (1<<3)  // Bit 3
-#define CONTROLWORD_FAULT_RESET_BIT          (1<<7)  // Bit 7
 
 // 在文件开头添加PDO统计结构体和函数定义
 struct PDOStats {
@@ -730,25 +780,6 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
     // PDO统计变量
     PDOStats pdo_stats = {LONG_MAX, 0, LONG_MAX, 0, 0, 0, 0};
 
-    // 设置线程优先级和CPU亲和性
-    struct sched_param param;
-    param.sched_priority = 99;
-    if (sched_setscheduler(0, SCHED_FIFO, &param) == -1) {
-        perror("sched_setscheduler failed");
-    }
-
-    // 锁定内存
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
-        perror("mlockall failed");
-    }
-
-    // 设置CPU亲和性
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(3, &cpuset);
-    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == -1) {
-        perror("pthread_setaffinity_np failed");
-    }
 
     // 初始化PDO数据
     rxpdo.mode_of_operation = 9;
@@ -764,16 +795,18 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
     }
 
     while (1) {
-        // 开始测量周期时间
-        clock_gettime(CLOCK_MONOTONIC, &cycle_start);
+        // 应该先等待下一个周期
+        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {
+            if (errno == EINTR) continue;
+        }
 
-        // 测量接收时间
-        clock_gettime(CLOCK_MONOTONIC, &pdo_start);
+        // 然后发送数据
+        ec_send_processdata();
+
+        // 最后接收数据
         wkc = ec_receive_processdata(EC_TIMEOUTRET);
-        clock_gettime(CLOCK_MONOTONIC, &pdo_end);
-        receive_time = (pdo_end.tv_sec - pdo_start.tv_sec) * NSEC_PER_SEC + 
-                      (pdo_end.tv_nsec - pdo_start.tv_nsec);
 
+        // 处理状态机
         if (wkc >= expectedWKC) {
             bool all_slaves_stable = true;
             
@@ -831,13 +864,19 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
                 memcpy(ec_slave[slave].outputs, &rxpdo, sizeof(rxpdo_t));
             }
         } else {
-            // 添加错误处理
             static int error_count = 0;
             error_count++;
-            if (error_count > 100) {  // 连续100次错误
+            if (error_count > 10) {  // 减少等待时间
                 printf("Communication error, WKC: %d/%d\n", wkc, expectedWKC);
                 error_count = 0;
+                
+                // 尝试重新初始化通信
+                ec_slave[0].state = EC_STATE_OPERATIONAL;
+                ec_writestate(0);
+                ec_send_processdata();
+                osal_usleep(1000);  // 短暂等待
             }
+            
             // 出错时保持安全状态
             for (int slave = 1; slave <= ec_slavecount; slave++) {
                 rxpdo.controlword = 0;
@@ -846,40 +885,11 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
             }
         }
 
-        // 测量发送时间
-        clock_gettime(CLOCK_MONOTONIC, &pdo_start);
-        ec_send_processdata();
-        clock_gettime(CLOCK_MONOTONIC, &pdo_end);
-        send_time = (pdo_end.tv_sec - pdo_start.tv_sec) * NSEC_PER_SEC + 
-                   (pdo_end.tv_nsec - pdo_start.tv_nsec);
-
         // 更新统计数据
         update_pdo_stats(pdo_stats, receive_time, send_time);
 
-        // 每1000个周期打印一次统计信息
-        if (pdo_stats.count >= 5000) {
-            printf("PDO Statistics:\n");
-            printf("  Receive time: %ld ns (min: %ld, max: %ld)\n", 
-                   receive_time, pdo_stats.min_receive_time, pdo_stats.max_receive_time);
-            printf("  Send time: %ld ns (min: %ld, max: %ld)\n", 
-                   send_time, pdo_stats.min_send_time, pdo_stats.max_send_time);
-            printf("  Jitter: %ld ns\n", pdo_stats.max_receive_time - pdo_stats.min_receive_time);
-            printf("  CPU core: %d\n", sched_getcpu());
-            printf("-------------------\n");
-            
-            // 重置统计数据
-            pdo_stats = {LONG_MAX, 0, LONG_MAX, 0, 0, 0, 0};
-        }
 
-        // 2. 发送数据
-        ec_send_processdata();
-        
-        // 3. 等待下一个周期
-        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {
-            if (errno == EINTR) continue;
-        }
-
-        // 4. 更新下一个周期的时间点
+        // 更新下一个周期时间
         ts.tv_nsec += cycletime;
         if (ts.tv_nsec >= NSEC_PER_SEC) {
             ts.tv_sec++;
@@ -888,7 +898,14 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
 
         // DC同步处理
         if (ec_slave[0].hasdc) {
-            // ... DC同步代码保持不变 ...
+            int64 reftime = ec_DCtime;
+            int64 diff = reftime - dc_time_offset;
+            dc_sync_counter++;
+            
+            if (dc_sync_counter >= DC_SYNC_INTERVAL) {
+                dc_sync_counter = 0;
+                ec_sync_pi(reftime, cycletime, &toff);
+            }
         }
     }
 }
