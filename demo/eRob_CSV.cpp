@@ -771,6 +771,7 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
     int64 dc_time_offset = 0;
     int dc_sync_counter = 0;
     const int DC_SYNC_INTERVAL = 10;
+    int step;
     
     // 状态机相关变量
     uint16_t slave_last_status[EC_MAXSLAVE] = {0};  // 从站状态记录
@@ -814,52 +815,25 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
             for (int slave = 1; slave <= ec_slavecount; slave++) {
                 memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
                 uint16_t status = txpdo.statusword;
-                
-                // 检查状态位
-                bool is_ready = (status & STATUSWORD_READY_TO_SWITCH_ON_BIT);
-                bool is_switched_on = (status & STATUSWORD_SWITCHED_ON_BIT);
-                bool is_enabled = (status & STATUSWORD_OPERATION_ENABLED_BIT);
-                bool has_fault = (status & STATUSWORD_FAULT_BIT);
-                bool is_disabled = (status & STATUSWORD_SWITCH_ON_DISABLED_BIT);
-
-                // 如果状态改变，重置计时器
-                if (status != slave_last_status[slave]) {
-                    state_timer[slave] = 0;
-                    printf("Slave %d: Status changed to 0x%04x\n", slave, status);
-                    slave_last_status[slave] = status;
-                    osal_usleep(1000);  // 状态变化时短暂延时
-                } else {
-                    state_timer[slave]++;
-                }
-
-                // 只有当状态稳定一段时间后才进行状态转换
-                if (state_timer[slave] < STATE_STABLE_TIME) {
-                    all_slaves_stable = false;
-                    continue;
-                }
+        
 
                 // 根据当前状态设置控制字
-                if (has_fault) {
-                    rxpdo.controlword = CONTROLWORD_FAULT_RESET_BIT;
-                } else if (is_disabled) {
-                    rxpdo.controlword = CONTROLWORD_ENABLE_VOLTAGE_BIT | CONTROLWORD_QUICK_STOP_BIT;
-                } else if (!is_ready) {
-                    rxpdo.controlword = CONTROLWORD_ENABLE_VOLTAGE_BIT | CONTROLWORD_QUICK_STOP_BIT;
-                } else if (!is_switched_on) {
-                    rxpdo.controlword = CONTROLWORD_SWITCH_ON_BIT | CONTROLWORD_ENABLE_VOLTAGE_BIT | 
-                                      CONTROLWORD_QUICK_STOP_BIT;
-                } else if (!is_enabled) {
-                    rxpdo.controlword = CONTROLWORD_SWITCH_ON_BIT | CONTROLWORD_ENABLE_VOLTAGE_BIT | 
-                                      CONTROLWORD_QUICK_STOP_BIT | CONTROLWORD_ENABLE_OPERATION_BIT;
-                } else {
-                    // 正常运行状态
-                    rxpdo.controlword = CONTROLWORD_SWITCH_ON_BIT | CONTROLWORD_ENABLE_VOLTAGE_BIT | 
-                                      CONTROLWORD_QUICK_STOP_BIT | CONTROLWORD_ENABLE_OPERATION_BIT;
-                    if (all_slaves_stable) {
-                        rxpdo.target_velocity = 1000;
-                    }
+                if (step<7000) {
+                    rxpdo.controlword = 0x80;
+                } else if (step<8000) {
+                    rxpdo.controlword = 0x06;
+                } else if (step<9000) {
+                    rxpdo.controlword = 0x07;
+                } else if (step<10000) {
+                    rxpdo.controlword = 0x0F;
+                    rxpdo.target_velocity = 0;
                 }
-
+                else if (step<11000)
+                {
+                    rxpdo.controlword = 0x0F;
+                    rxpdo.target_velocity = 0; /* code */
+                }
+                
                 rxpdo.mode_of_operation = 9;  // CSV模式
                 memcpy(ec_slave[slave].outputs, &rxpdo, sizeof(rxpdo_t));
             }
@@ -886,8 +860,13 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
         }
 
         // 更新统计数据
-        update_pdo_stats(pdo_stats, receive_time, send_time);
-
+        //update_pdo_stats(pdo_stats, receive_time, send_time);
+        
+        if (step < 11000)
+        {
+           step ++; /* code */
+        }
+        
 
         // 更新下一个周期时间
         ts.tv_nsec += cycletime;
